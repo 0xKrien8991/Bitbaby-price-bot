@@ -51,8 +51,8 @@ def http_post_json(url, data, headers=None):
         req = urllib.request.Request(url, data=body, headers=h, method="POST")
         with urllib.request.urlopen(req, timeout=8) as resp:
             return json.loads(resp.read().decode())
-    except Exception:
-        return None
+    except Exception as e:
+        return {"_error": str(e)}
 
 
 def http_post_form(url, data):
@@ -192,9 +192,10 @@ def redis_get(key):
 
 def redis_set(key, value):
     if not UPSTASH_URL:
-        return False
+        return None
     headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    return http_post_json(f"{UPSTASH_URL}", ["SET", key, value], headers) is not None
+    result = http_post_json(f"{UPSTASH_URL}", ["SET", key, value], headers)
+    return result
 
 
 def redis_del(key):
@@ -215,7 +216,7 @@ def get_buttons():
 
 
 def save_buttons(buttons):
-    redis_set(REDIS_BUTTONS_KEY, json.dumps(buttons))
+    return redis_set(REDIS_BUTTONS_KEY, json.dumps(buttons))
 
 
 def get_lang(chat_id):
@@ -459,8 +460,9 @@ def handle_message(msg):
         text_en, text_zh, btn_url = parsed
         buttons = get_buttons()
         buttons.append({"text_en": text_en, "text_zh": text_zh, "url": btn_url})
-        save_buttons(buttons)
-        tg_send(chat_id, t("btn_added", lang, text=f"{text_en} / {text_zh}"))
+        result = save_buttons(buttons)
+        debug = f"\n\n[DEBUG] Redis response: {result}\n[DEBUG] UPSTASH_URL set: {bool(UPSTASH_URL)}"
+        tg_send(chat_id, t("btn_added", lang, text=f"{text_en} / {text_zh}") + debug)
         return
 
     if text.startswith("/editbutton"):
