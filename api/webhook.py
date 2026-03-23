@@ -130,23 +130,23 @@ TEXTS = {
     "admin_help": {
         "en": (
             "🔧 Admin Commands:\n\n"
-            "• /addbutton <text> | <url>\n"
-            "• /editbutton <num> <text> | <url>\n"
+            "• /addbutton EN text | 中文 | URL\n"
+            "• /editbutton <num> EN | 中文 | URL\n"
             "• /removebutton <num>\n"
             "• /listbuttons\n"
             "• /clearbuttons\n\n"
             "Example:\n"
-            "/addbutton 🚀 Trade | https://www.bitbaby.com/en-us"
+            "/addbutton 🚀 Trade on BitBaby | 🚀 去 BitBaby 交易 | https://www.bitbaby.com/en-us"
         ),
         "zh": (
             "🔧 管理员指令：\n\n"
-            "• /addbutton <文字> | <链接>\n"
-            "• /editbutton <编号> <文字> | <链接>\n"
+            "• /addbutton 英文文字 | 中文文字 | 链接\n"
+            "• /editbutton <编号> 英文 | 中文 | 链接\n"
             "• /removebutton <编号>\n"
             "• /listbuttons\n"
             "• /clearbuttons\n\n"
             "示例：\n"
-            "/addbutton 🚀 去交易 | https://www.bitbaby.com/en-us"
+            "/addbutton 🚀 Trade on BitBaby | 🚀 去 BitBaby 交易 | https://www.bitbaby.com/en-us"
         ),
     },
     "welcome": {
@@ -161,7 +161,10 @@ TEXTS = {
     "btn_removed":     {"en": "✅ Button #{num} removed.", "zh": "✅ 按钮 #{num} 已删除。"},
     "btn_cleared":     {"en": "✅ All buttons cleared.", "zh": "✅ 所有按钮已清空。"},
     "btn_list_empty":  {"en": "📋 No buttons yet. Use /addbutton", "zh": "📋 还没有按钮。使用 /addbutton 添加"},
-    "btn_invalid_fmt": {"en": "❌ Format: /addbutton Text | URL", "zh": "❌ 格式：/addbutton 文字 | 链接"},
+    "btn_invalid_fmt": {
+        "en": "❌ Format: /addbutton EN text | 中文文字 | URL",
+        "zh": "❌ 格式：/addbutton 英文文字 | 中文文字 | 链接",
+    },
     "btn_invalid_num": {"en": "❌ Invalid number.", "zh": "❌ 无效编号。"},
     "trending_title":  {"en": "🔥 Trending Coins", "zh": "🔥 热门代币"},
     "trending_empty":  {"en": "No trending data.", "zh": "暂无热门数据。"},
@@ -334,7 +337,13 @@ def price_keyboard(symbol, lang):
     buttons = get_buttons()
     keyboard = []
     for btn in buttons:
-        keyboard.append([{"text": btn["text"], "url": btn["url"]}])
+        # Support bilingual: {"text_en": "...", "text_zh": "...", "url": "..."}
+        # Also backward compatible with old format: {"text": "...", "url": "..."}
+        if "text_en" in btn:
+            btn_text = btn["text_zh"] if lang == "zh" else btn["text_en"]
+        else:
+            btn_text = btn.get("text", "")
+        keyboard.append([{"text": btn_text, "url": btn["url"]}])
     target_lang = "zh" if lang == "en" else "en"
     keyboard.append([{
         "text": t("btn_lang_switch", lang),
@@ -387,14 +396,19 @@ def is_admin(user_id):
 
 
 def parse_button_input(text):
-    if "|" not in text:
-        return None
-    parts = text.split("|", 1)
-    btn_text = parts[0].strip()
-    btn_url = parts[1].strip()
-    if not btn_text or not btn_url:
-        return None
-    return (btn_text, btn_url)
+    """Parse 'EN text | 中文文字 | URL' or 'text | URL' format.
+    Returns (text_en, text_zh, url) or None.
+    """
+    parts = [p.strip() for p in text.split("|")]
+    if len(parts) == 3:
+        # EN text | ZH text | URL
+        if parts[0] and parts[1] and parts[2]:
+            return (parts[0], parts[1], parts[2])
+    elif len(parts) == 2:
+        # Same text for both | URL
+        if parts[0] and parts[1]:
+            return (parts[0], parts[0], parts[1])
+    return None
 
 
 # ─── Bot Logic ───────────────────────────────────────────────────
@@ -442,11 +456,11 @@ def handle_message(msg):
         if not parsed:
             tg_send(chat_id, t("btn_invalid_fmt", lang))
             return
-        btn_text, btn_url = parsed
+        text_en, text_zh, btn_url = parsed
         buttons = get_buttons()
-        buttons.append({"text": btn_text, "url": btn_url})
+        buttons.append({"text_en": text_en, "text_zh": text_zh, "url": btn_url})
         save_buttons(buttons)
-        tg_send(chat_id, t("btn_added", lang, text=btn_text))
+        tg_send(chat_id, t("btn_added", lang, text=f"{text_en} / {text_zh}"))
         return
 
     if text.startswith("/editbutton"):
@@ -470,10 +484,10 @@ def handle_message(msg):
         if idx < 0 or idx >= len(buttons):
             tg_send(chat_id, t("btn_invalid_num", lang))
             return
-        btn_text, btn_url = parsed
-        buttons[idx] = {"text": btn_text, "url": btn_url}
+        text_en, text_zh, btn_url = parsed
+        buttons[idx] = {"text_en": text_en, "text_zh": text_zh, "url": btn_url}
         save_buttons(buttons)
-        tg_send(chat_id, t("btn_edited", lang, num=idx + 1, text=btn_text))
+        tg_send(chat_id, t("btn_edited", lang, num=idx + 1, text=f"{text_en} / {text_zh}"))
         return
 
     if text.startswith("/removebutton"):
@@ -508,7 +522,10 @@ def handle_message(msg):
             return
         lines = ["📋 Current Buttons:" if lang == "en" else "📋 当前按钮：", ""]
         for i, btn in enumerate(buttons, 1):
-            lines.append(f"{i}. {btn['text']}\n   → {btn['url']}")
+            if "text_en" in btn:
+                lines.append(f"{i}. EN: {btn['text_en']}\n   ZH: {btn['text_zh']}\n   → {btn['url']}")
+            else:
+                lines.append(f"{i}. {btn.get('text', '?')}\n   → {btn['url']}")
         tg_send(chat_id, "\n".join(lines))
         return
 
@@ -628,7 +645,10 @@ def handle_inline_query(iq):
         return
     msg_text = build_price_msg(price_data, DEFAULT_LANG)
     buttons = get_buttons()
-    keyboard = [[{"text": b["text"], "url": b["url"]}] for b in buttons]
+    keyboard = []
+    for b in buttons:
+        bt = b.get("text_en", b.get("text", ""))
+        keyboard.append([{"text": bt, "url": b["url"]}])
     result = {
         "type": "article",
         "id": f"price_{price_data['symbol']}",
