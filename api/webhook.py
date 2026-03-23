@@ -3,6 +3,9 @@ Vercel Serverless Function — Telegram Bot Webhook Handler.
 
 Features:
 - CoinGecko price queries (/p, /price, $SYMBOL)
+- Multi-token query (/p btc eth sol)
+- Trending tokens (/trending)
+- Inline query mode (@bot btc)
 - Chinese/English language switch
 - Dynamic button management via admin commands
 - Upstash Redis for persistent storage (buttons + language prefs)
@@ -78,20 +81,24 @@ TEXTS = {
     "help": {
         "en": (
             "📖 BitBaby Price Bot\n\n"
-            "Query crypto prices:\n"
             "• /p <symbol> — Query price\n"
-            "• /price <symbol> — Query price\n"
-            "• $<symbol> — Quick query (e.g. $BTC)\n\n"
-            "Examples: /p btc, /price eth, $sol\n\n"
+            "• /p btc eth sol — Multi query\n"
+            "• $BTC — Quick query\n"
+            "• /trending — Trending coins\n"
+            "• /lang en|zh — Switch language\n\n"
+            "Also works in inline mode:\n"
+            "Type @botname btc in any chat.\n\n"
             "Click 🌐 to switch language."
         ),
         "zh": (
             "📖 BitBaby 报价机器人\n\n"
-            "查询代币价格：\n"
             "• /p <代币> — 查询价格\n"
-            "• /price <代币> — 查询价格\n"
-            "• $<代币> — 快捷查询（如 $BTC）\n\n"
-            "示例：/p btc、/price eth、$sol\n\n"
+            "• /p btc eth sol — 多币种查询\n"
+            "• $BTC — 快捷查询\n"
+            "• /trending — 热门代币\n"
+            "• /lang en|zh — 切换语言\n\n"
+            "也支持内联模式：\n"
+            "在任意聊天框输入 @机器人用户名 btc\n\n"
             "点击 🌐 切换语言。"
         ),
     },
@@ -141,6 +148,9 @@ TEXTS = {
     "btn_list_empty":  {"en": "📋 No buttons configured yet.\nUse /addbutton to add one.", "zh": "📋 还没有配置按钮。\n使用 /addbutton 添加。"},
     "btn_invalid_fmt": {"en": "❌ Format: /addbutton Button Text | https://url", "zh": "❌ 格式：/addbutton 按钮文字 | https://链接"},
     "btn_invalid_num": {"en": "❌ Invalid button number.", "zh": "❌ 无效的按钮编号。"},
+    "trending_title":  {"en": "🔥 Trending Coins", "zh": "🔥 热门代币"},
+    "trending_empty":  {"en": "No trending data available.", "zh": "暂无热门数据。"},
+    "multi_query_max": {"en": "⚠️ Max 5 tokens per query.", "zh": "⚠️ 每次最多查询 5 个代币。"},
 }
 
 
@@ -288,6 +298,26 @@ async def fetch_price(symbol: str) -> dict | None:
         "low_24h": m.get("low_24h", {}).get("usd"),
         "rank": data.get("market_cap_rank"),
     }
+
+
+async def fetch_trending() -> list[dict]:
+    """Fetch trending coins from CoinGecko."""
+    async with aiohttp.ClientSession() as s:
+        async with s.get(f"{COINGECKO_API}/search/trending") as r:
+            if r.status != 200:
+                return []
+            data = await r.json()
+    results = []
+    for item in data.get("coins", [])[:10]:
+        coin = item.get("item", {})
+        results.append({
+            "name": coin.get("name", ""),
+            "symbol": coin.get("symbol", "").upper(),
+            "rank": coin.get("market_cap_rank"),
+            "price_btc": coin.get("price_btc", 0),
+            "score": coin.get("score", 0),
+        })
+    return results
 
 
 # ─── Message Builder ─────────────────────────────────────────────
@@ -506,30 +536,40 @@ async def handle_message(msg: dict):
         await tg_send(chat_id, t("btn_cleared", lang))
         return
 
-    # ── Price Queries ──
+    # ── Trending ──
+
+    if text.startswith("/trending"):
+        await handle_trending(chat_id, lang)
+        return
+
+    # ── Price Queries (multi-token support) ──
 
     if text.startswith("/p ") or text.startswith("/price "):
         parts = text.split()
-        if len(parts) >= 2:
-            symbol = parts[1].upper()
-            await query_and_reply(chat_id, symbol, lang)
-        else:
+        symbols = [s.upper() for s in parts[1:] if s and not s.startswith("/")]
+        if not symbols:
             await tg_send(chat_id, t("help", lang), simple_keyboard(lang, "help"))
+            return
+        if len(symbols) > 5:
+            await tg_send(chat_id, t("multi_query_max", lang))
+            symbols = symbols[:5]
+        for symbol in symbols:
+            await query_and_reply(chat_id, symbol, lang)
         return
 
     # /p@botname <symbol> (group commands with bot username)
     if text.startswith("/p@") or text.startswith("/price@"):
         parts = text.split()
-        if len(parts) >= 2:
-            symbol = parts[1].upper()
+        symbols = [s.upper() for s in parts[1:] if s]
+        for symbol in symbols[:5]:
             await query_and_reply(chat_id, symbol, lang)
         return
 
-    # $BTC style
+    # $BTC style (supports multiple: $BTC $ETH)
     matches = re.findall(r"\$([A-Za-z0-9]{1,10})", text)
     if matches:
-        symbol = matches[0].upper()
-        await query_and_reply(chat_id, symbol, lang)
+        for symbol in [m.upper() for m in matches[:5]]:
+            await query_and_reply(chat_id, symbol, lang)
 
 
 async def handle_callback_query(cbq: dict):
@@ -574,6 +614,32 @@ async def handle_callback_query(cbq: dict):
             await tg_edit(chat_id, message_id, text, simple_keyboard(new_lang, msg_type))
 
 
+async def handle_trending(chat_id: int, lang: str):
+    """Fetch and send trending coins."""
+    try:
+        coins = await fetch_trending()
+    except Exception:
+        await tg_send(chat_id, t("error", lang))
+        return
+
+    if not coins:
+        await tg_send(chat_id, t("trending_empty", lang))
+        return
+
+    lines = [t("trending_title", lang), "━" * 24]
+    for i, coin in enumerate(coins, 1):
+        rank_str = f"#{coin['rank']}" if coin.get("rank") else "—"
+        lines.append(f"{i}. {coin['name']} ({coin['symbol']})  [{rank_str}]")
+
+    # Add tip to query
+    if lang == "zh":
+        lines.append("\n💡 输入 /p <代币> 查看详情")
+    else:
+        lines.append("\n💡 Use /p <symbol> for details")
+
+    await tg_send(chat_id, "\n".join(lines), simple_keyboard(lang, "help"))
+
+
 async def query_and_reply(chat_id: int, symbol: str, lang: str):
     """Fetch price and send to chat."""
     try:
@@ -589,6 +655,59 @@ async def query_and_reply(chat_id: int, symbol: str, lang: str):
     text = build_price_msg(price_data, lang)
     kb = await price_keyboard(symbol, lang)
     await tg_send(chat_id, text, kb)
+
+
+async def handle_inline_query(inline_query: dict):
+    """Handle inline mode: user types @botname btc in any chat."""
+    query_id = inline_query["id"]
+    query_text = inline_query.get("query", "").strip()
+
+    if not query_text or len(query_text) < 1:
+        # Return empty result
+        await tg_answer_inline(query_id, [])
+        return
+
+    # Try to fetch price for the query
+    try:
+        price_data = await fetch_price(query_text)
+    except Exception:
+        await tg_answer_inline(query_id, [])
+        return
+
+    if not price_data:
+        await tg_answer_inline(query_id, [])
+        return
+
+    # Build result
+    lang = DEFAULT_LANG
+    msg_text = build_price_msg(price_data, lang)
+    buttons = await get_buttons()
+    keyboard = []
+    for btn in buttons:
+        keyboard.append([{"text": btn["text"], "url": btn["url"]}])
+
+    result = {
+        "type": "article",
+        "id": f"price_{price_data['symbol']}",
+        "title": f"{price_data['name']} ({price_data['symbol']})",
+        "description": f"${fmt_num(price_data['price_usd'])}  {fmt_change(price_data.get('change_24h'))}%",
+        "input_message_content": {"message_text": msg_text},
+    }
+    if keyboard:
+        result["reply_markup"] = {"inline_keyboard": keyboard}
+
+    await tg_answer_inline(query_id, [result])
+
+
+async def tg_answer_inline(inline_query_id: str, results: list):
+    """Answer an inline query."""
+    payload = {
+        "inline_query_id": inline_query_id,
+        "results": json.dumps(results),
+        "cache_time": 30,
+    }
+    async with aiohttp.ClientSession() as s:
+        await s.post(f"{TELEGRAM_API}/answerInlineQuery", data=payload)
 
 
 # ─── Vercel Handler ──────────────────────────────────────────────
@@ -611,6 +730,8 @@ class handler(BaseHTTPRequestHandler):
             asyncio.run(handle_message(update["message"]))
         elif "callback_query" in update:
             asyncio.run(handle_callback_query(update["callback_query"]))
+        elif "inline_query" in update:
+            asyncio.run(handle_inline_query(update["inline_query"]))
 
         self.send_response(200)
         self.end_headers()
