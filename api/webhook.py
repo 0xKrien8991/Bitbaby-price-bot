@@ -20,8 +20,8 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en")
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
-UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
+UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "").strip()
+UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "").strip()
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 COINGECKO_API = "https://api.coingecko.com/api/v3"
