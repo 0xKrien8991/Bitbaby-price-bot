@@ -1,47 +1,74 @@
 """
 Vercel Serverless Function — Telegram Bot Webhook Handler.
 
-Features:
-- CoinGecko price queries (/p, /price, $SYMBOL)
-- Multi-token query (/p btc eth sol)
-- Trending tokens (/trending)
-- Inline query mode (@bot btc)
-- Chinese/English language switch
-- Dynamic button management via admin commands
-- Upstash Redis for persistent storage (buttons + language prefs)
+Uses only Python stdlib (urllib) — no third-party dependencies needed.
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import re
+import urllib.request
+import urllib.parse
+import urllib.error
 from http.server import BaseHTTPRequestHandler
-
-import aiohttp
 
 # ─── Config ───────────────────────────────────────────────────────
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 DEFAULT_LANG = os.getenv("DEFAULT_LANG", "en")
-# Comma-separated Telegram user IDs who can manage buttons
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 
-# Upstash Redis REST API
 UPSTASH_URL = os.getenv("UPSTASH_REDIS_REST_URL", "")
 UPSTASH_TOKEN = os.getenv("UPSTASH_REDIS_REST_TOKEN", "")
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 
-# Redis keys
 REDIS_BUTTONS_KEY = "bitbaby:buttons"
 REDIS_LANG_PREFIX = "bitbaby:lang:"
 
+# ─── HTTP Helper ──────────────────────────────────────────────────
+
+def http_get(url, headers=None):
+    """Simple HTTP GET returning parsed JSON or None."""
+    try:
+        req = urllib.request.Request(url, headers=headers or {})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def http_post_json(url, data, headers=None):
+    """HTTP POST with JSON body."""
+    try:
+        body = json.dumps(data).encode()
+        h = {"Content-Type": "application/json"}
+        if headers:
+            h.update(headers)
+        req = urllib.request.Request(url, data=body, headers=h, method="POST")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def http_post_form(url, data):
+    """HTTP POST with form data."""
+    try:
+        body = urllib.parse.urlencode(data).encode()
+        req = urllib.request.Request(url, data=body, method="POST")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
 # ─── CoinGecko Symbol Mapping ────────────────────────────────────
 
-SYMBOL_TO_ID: dict[str, str] = {
+SYMBOL_TO_ID = {
     "btc": "bitcoin", "eth": "ethereum", "usdt": "tether", "usdc": "usd-coin",
     "bnb": "binancecoin", "xrp": "ripple", "ada": "cardano", "doge": "dogecoin",
     "sol": "solana", "dot": "polkadot", "matic": "matic-network", "pol": "matic-network",
@@ -77,8 +104,8 @@ TEXTS = {
     "rank":            {"en": "Rank: #{rank}", "zh": "排名: #{rank}"},
     "btn_lang_switch": {"en": "🌐 中文", "zh": "🌐 English"},
     "not_found": {
-        "en": '❌ Token "{symbol}" not found. Please check the symbol and try again.',
-        "zh": '❌ 未找到代币 "{symbol}"，请检查代币符号后重试。',
+        "en": '❌ Token "{symbol}" not found.',
+        "zh": '❌ 未找到代币 "{symbol}"。',
     },
     "help": {
         "en": (
@@ -88,8 +115,6 @@ TEXTS = {
             "• $BTC — Quick query\n"
             "• /trending — Trending coins\n"
             "• /lang en|zh — Switch language\n\n"
-            "Also works in inline mode:\n"
-            "Type @botname btc in any chat.\n\n"
             "Click 🌐 to switch language."
         ),
         "zh": (
@@ -99,8 +124,6 @@ TEXTS = {
             "• $BTC — 快捷查询\n"
             "• /trending — 热门代币\n"
             "• /lang en|zh — 切换语言\n\n"
-            "也支持内联模式：\n"
-            "在任意聊天框输入 @机器人用户名 btc\n\n"
             "点击 🌐 切换语言。"
         ),
     },
@@ -108,32 +131,22 @@ TEXTS = {
         "en": (
             "🔧 Admin Commands:\n\n"
             "• /addbutton <text> | <url>\n"
-            "  Add a button below price messages\n\n"
-            "• /editbutton <number> <text> | <url>\n"
-            "  Edit an existing button\n\n"
-            "• /removebutton <number>\n"
-            "  Remove a button by its number\n\n"
+            "• /editbutton <num> <text> | <url>\n"
+            "• /removebutton <num>\n"
             "• /listbuttons\n"
-            "  Show all current buttons\n\n"
-            "• /clearbuttons\n"
-            "  Remove all buttons\n\n"
+            "• /clearbuttons\n\n"
             "Example:\n"
-            "/addbutton 🚀 Trade on BitBaby | https://www.bitbaby.com/en-us"
+            "/addbutton 🚀 Trade | https://www.bitbaby.com/en-us"
         ),
         "zh": (
             "🔧 管理员指令：\n\n"
             "• /addbutton <文字> | <链接>\n"
-            "  添加价格消息下方的按钮\n\n"
             "• /editbutton <编号> <文字> | <链接>\n"
-            "  修改已有按钮\n\n"
             "• /removebutton <编号>\n"
-            "  按编号删除按钮\n\n"
             "• /listbuttons\n"
-            "  查看所有按钮\n\n"
-            "• /clearbuttons\n"
-            "  清空所有按钮\n\n"
+            "• /clearbuttons\n\n"
             "示例：\n"
-            "/addbutton 🚀 去 BitBaby 交易 | https://www.bitbaby.com/en-us"
+            "/addbutton 🚀 去交易 | https://www.bitbaby.com/en-us"
         ),
     },
     "welcome": {
@@ -141,101 +154,79 @@ TEXTS = {
         "zh": "👋 欢迎使用 BitBaby 报价机器人！\n\n使用 /help 查看指令。\n试试：/p btc 或 $eth",
     },
     "lang_switched":   {"en": "✅ Language switched to English", "zh": "✅ 语言已切换为中文"},
-    "error":           {"en": "⚠️ Failed to fetch price. Please try again later.", "zh": "⚠️ 获取价格失败，请稍后重试。"},
+    "error":           {"en": "⚠️ Error. Try again later.", "zh": "⚠️ 出错了，请稍后重试。"},
     "no_permission":   {"en": "🚫 Admin only.", "zh": "🚫 仅管理员可用。"},
     "btn_added":       {"en": "✅ Button added: {text}", "zh": "✅ 按钮已添加：{text}"},
     "btn_edited":      {"en": "✅ Button #{num} updated: {text}", "zh": "✅ 按钮 #{num} 已更新：{text}"},
     "btn_removed":     {"en": "✅ Button #{num} removed.", "zh": "✅ 按钮 #{num} 已删除。"},
     "btn_cleared":     {"en": "✅ All buttons cleared.", "zh": "✅ 所有按钮已清空。"},
-    "btn_list_empty":  {"en": "📋 No buttons configured yet.\nUse /addbutton to add one.", "zh": "📋 还没有配置按钮。\n使用 /addbutton 添加。"},
-    "btn_invalid_fmt": {"en": "❌ Format: /addbutton Button Text | https://url", "zh": "❌ 格式：/addbutton 按钮文字 | https://链接"},
-    "btn_invalid_num": {"en": "❌ Invalid button number.", "zh": "❌ 无效的按钮编号。"},
+    "btn_list_empty":  {"en": "📋 No buttons yet. Use /addbutton", "zh": "📋 还没有按钮。使用 /addbutton 添加"},
+    "btn_invalid_fmt": {"en": "❌ Format: /addbutton Text | URL", "zh": "❌ 格式：/addbutton 文字 | 链接"},
+    "btn_invalid_num": {"en": "❌ Invalid number.", "zh": "❌ 无效编号。"},
     "trending_title":  {"en": "🔥 Trending Coins", "zh": "🔥 热门代币"},
-    "trending_empty":  {"en": "No trending data available.", "zh": "暂无热门数据。"},
-    "multi_query_max": {"en": "⚠️ Max 5 tokens per query.", "zh": "⚠️ 每次最多查询 5 个代币。"},
+    "trending_empty":  {"en": "No trending data.", "zh": "暂无热门数据。"},
+    "multi_query_max": {"en": "⚠️ Max 5 tokens.", "zh": "⚠️ 最多查 5 个。"},
 }
 
 
-def t(key: str, lang: str = "en", **kwargs) -> str:
+def t(key, lang="en", **kw):
     entry = TEXTS.get(key, {})
     text = entry.get(lang, entry.get("en", f"[{key}]"))
-    if kwargs:
-        text = text.format(**kwargs)
+    if kw:
+        text = text.format(**kw)
     return text
 
 
-# ─── Upstash Redis Helpers ───────────────────────────────────────
+# ─── Redis ───────────────────────────────────────────────────────
 
-async def redis_get(key: str) -> str | None:
-    """GET a value from Upstash Redis."""
+def redis_get(key):
     if not UPSTASH_URL:
         return None
     headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    async with aiohttp.ClientSession() as s:
-        async with s.get(f"{UPSTASH_URL}/get/{key}", headers=headers) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
-            return data.get("result")
+    data = http_get(f"{UPSTASH_URL}/get/{key}", headers)
+    return data.get("result") if data else None
 
 
-async def redis_set(key: str, value: str) -> bool:
-    """SET a value in Upstash Redis."""
+def redis_set(key, value):
     if not UPSTASH_URL:
         return False
     headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    async with aiohttp.ClientSession() as s:
-        async with s.post(f"{UPSTASH_URL}", headers=headers,
-                          json=["SET", key, value]) as r:
-            return r.status == 200
+    return http_post_json(f"{UPSTASH_URL}", ["SET", key, value], headers) is not None
 
 
-async def redis_del(key: str) -> bool:
-    """DEL a key from Upstash Redis."""
+def redis_del(key):
     if not UPSTASH_URL:
         return False
     headers = {"Authorization": f"Bearer {UPSTASH_TOKEN}"}
-    async with aiohttp.ClientSession() as s:
-        async with s.post(f"{UPSTASH_URL}", headers=headers,
-                          json=["DEL", key]) as r:
-            return r.status == 200
+    return http_post_json(f"{UPSTASH_URL}", ["DEL", key], headers) is not None
 
 
-# ─── Button Storage ──────────────────────────────────────────────
-# Buttons stored as JSON array: [{"text": "Trade", "url": "https://..."}, ...]
-
-async def get_buttons() -> list[dict]:
-    """Get all configured buttons from Redis."""
-    raw = await redis_get(REDIS_BUTTONS_KEY)
+def get_buttons():
+    raw = redis_get(REDIS_BUTTONS_KEY)
     if not raw:
         return []
     try:
         return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
+    except Exception:
         return []
 
 
-async def save_buttons(buttons: list[dict]) -> bool:
-    """Save buttons to Redis."""
-    return await redis_set(REDIS_BUTTONS_KEY, json.dumps(buttons))
+def save_buttons(buttons):
+    redis_set(REDIS_BUTTONS_KEY, json.dumps(buttons))
 
 
-# ─── Language Storage ────────────────────────────────────────────
-
-async def get_lang(chat_id: int) -> str:
-    """Get language preference for a chat from Redis."""
-    result = await redis_get(f"{REDIS_LANG_PREFIX}{chat_id}")
+def get_lang(chat_id):
+    result = redis_get(f"{REDIS_LANG_PREFIX}{chat_id}")
     return result if result in ("en", "zh") else DEFAULT_LANG
 
 
-async def set_lang(chat_id: int, lang: str) -> None:
-    """Save language preference for a chat to Redis."""
-    await redis_set(f"{REDIS_LANG_PREFIX}{chat_id}", lang)
+def set_lang(chat_id, lang):
+    redis_set(f"{REDIS_LANG_PREFIX}{chat_id}", lang)
 
 
 # ─── Formatters ──────────────────────────────────────────────────
 
-def fmt_num(v) -> str:
+def fmt_num(v):
     if v is None:
         return "N/A"
     if v >= 1_000_000_000_000:
@@ -251,7 +242,7 @@ def fmt_num(v) -> str:
     return f"{v:.8f}"
 
 
-def fmt_change(v) -> str:
+def fmt_change(v):
     if v is None:
         return "N/A"
     arrow = "📈" if v >= 0 else "📉"
@@ -260,33 +251,32 @@ def fmt_change(v) -> str:
 
 # ─── CoinGecko ───────────────────────────────────────────────────
 
-async def search_coin_id(symbol: str) -> str | None:
+def search_coin_id(symbol):
     sym = symbol.lower().strip()
     if sym in SYMBOL_TO_ID:
         return SYMBOL_TO_ID[sym]
-    async with aiohttp.ClientSession() as s:
-        async with s.get(f"{COINGECKO_API}/search", params={"query": sym}) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
-            for c in data.get("coins", []):
-                if c.get("symbol", "").lower() == sym:
-                    return c["id"]
-            coins = data.get("coins", [])
-            return coins[0]["id"] if coins else None
+    q = urllib.parse.urlencode({"query": sym})
+    data = http_get(f"{COINGECKO_API}/search?{q}")
+    if not data:
+        return None
+    for c in data.get("coins", []):
+        if c.get("symbol", "").lower() == sym:
+            return c["id"]
+    coins = data.get("coins", [])
+    return coins[0]["id"] if coins else None
 
 
-async def fetch_price(symbol: str) -> dict | None:
-    coin_id = await search_coin_id(symbol)
+def fetch_price(symbol):
+    coin_id = search_coin_id(symbol)
     if not coin_id:
         return None
-    params = {"localization": "false", "tickers": "false",
-              "community_data": "false", "developer_data": "false", "sparkline": "false"}
-    async with aiohttp.ClientSession() as s:
-        async with s.get(f"{COINGECKO_API}/coins/{coin_id}", params=params) as r:
-            if r.status != 200:
-                return None
-            data = await r.json()
+    q = urllib.parse.urlencode({
+        "localization": "false", "tickers": "false",
+        "community_data": "false", "developer_data": "false", "sparkline": "false",
+    })
+    data = http_get(f"{COINGECKO_API}/coins/{coin_id}?{q}")
+    if not data:
+        return None
     m = data.get("market_data", {})
     return {
         "name": data.get("name", "Unknown"),
@@ -302,13 +292,10 @@ async def fetch_price(symbol: str) -> dict | None:
     }
 
 
-async def fetch_trending() -> list[dict]:
-    """Fetch trending coins from CoinGecko."""
-    async with aiohttp.ClientSession() as s:
-        async with s.get(f"{COINGECKO_API}/search/trending") as r:
-            if r.status != 200:
-                return []
-            data = await r.json()
+def fetch_trending():
+    data = http_get(f"{COINGECKO_API}/search/trending")
+    if not data:
+        return []
     results = []
     for item in data.get("coins", [])[:10]:
         coin = item.get("item", {})
@@ -316,15 +303,13 @@ async def fetch_trending() -> list[dict]:
             "name": coin.get("name", ""),
             "symbol": coin.get("symbol", "").upper(),
             "rank": coin.get("market_cap_rank"),
-            "price_btc": coin.get("price_btc", 0),
-            "score": coin.get("score", 0),
         })
     return results
 
 
 # ─── Message Builder ─────────────────────────────────────────────
 
-def build_price_msg(data: dict, lang: str) -> str:
+def build_price_msg(data, lang):
     lines = [t("price_title", lang, name=data["name"], symbol=data["symbol"])]
     lines.append("━" * 24)
     if data.get("rank"):
@@ -343,69 +328,65 @@ def build_price_msg(data: dict, lang: str) -> str:
     return "\n".join(lines)
 
 
-# ─── Keyboard Builders ──────────────────────────────────────────
+# ─── Keyboards ───────────────────────────────────────────────────
 
-async def price_keyboard(symbol: str, lang: str) -> dict:
-    """Build keyboard with dynamic buttons + language switch."""
-    buttons = await get_buttons()
+def price_keyboard(symbol, lang):
+    buttons = get_buttons()
     keyboard = []
-
-    # Custom buttons from Redis (one per row)
     for btn in buttons:
         keyboard.append([{"text": btn["text"], "url": btn["url"]}])
-
-    # Language switch button (always last row)
     target_lang = "zh" if lang == "en" else "en"
     keyboard.append([{
         "text": t("btn_lang_switch", lang),
         "callback_data": f"lang:{target_lang}:{symbol}",
     }])
-
     return {"inline_keyboard": keyboard}
 
 
-def simple_keyboard(lang: str, msg_type: str = "help") -> dict:
+def simple_keyboard(lang, msg_type="help"):
     target_lang = "zh" if lang == "en" else "en"
-    return {
-        "inline_keyboard": [[{
-            "text": t("btn_lang_switch", lang),
-            "callback_data": f"slang:{target_lang}:{msg_type}",
-        }]]
-    }
+    return {"inline_keyboard": [[{
+        "text": t("btn_lang_switch", lang),
+        "callback_data": f"slang:{target_lang}:{msg_type}",
+    }]]}
 
 
-# ─── Telegram API Helpers ────────────────────────────────────────
+# ─── Telegram API ────────────────────────────────────────────────
 
-async def tg_send(chat_id, text, reply_markup=None):
+def tg_send(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
-    async with aiohttp.ClientSession() as s:
-        await s.post(f"{TELEGRAM_API}/sendMessage", data=payload)
+    http_post_json(f"{TELEGRAM_API}/sendMessage", payload)
 
 
-async def tg_edit(chat_id, message_id, text, reply_markup=None):
+def tg_edit(chat_id, message_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = json.dumps(reply_markup)
-    async with aiohttp.ClientSession() as s:
-        await s.post(f"{TELEGRAM_API}/editMessageText", data=payload)
+    http_post_json(f"{TELEGRAM_API}/editMessageText", payload)
 
 
-async def tg_answer_callback(callback_query_id):
-    async with aiohttp.ClientSession() as s:
-        await s.post(f"{TELEGRAM_API}/answerCallbackQuery",
-                     data={"callback_query_id": callback_query_id})
+def tg_answer_callback(callback_query_id):
+    http_post_json(f"{TELEGRAM_API}/answerCallbackQuery",
+                   {"callback_query_id": callback_query_id})
 
 
-# ─── Admin Command Helpers ───────────────────────────────────────
+def tg_answer_inline(inline_query_id, results):
+    http_post_json(f"{TELEGRAM_API}/answerInlineQuery", {
+        "inline_query_id": inline_query_id,
+        "results": results,
+        "cache_time": 30,
+    })
 
-def is_admin(user_id: int) -> bool:
+
+# ─── Admin Helpers ───────────────────────────────────────────────
+
+def is_admin(user_id):
     return user_id in ADMIN_IDS
 
 
-def parse_button_input(text: str) -> tuple[str, str] | None:
-    """Parse 'Button Text | https://url' format. Returns (text, url) or None."""
+def parse_button_input(text):
     if "|" not in text:
         return None
     parts = text.split("|", 1)
@@ -418,329 +399,280 @@ def parse_button_input(text: str) -> tuple[str, str] | None:
 
 # ─── Bot Logic ───────────────────────────────────────────────────
 
-async def handle_message(msg: dict):
-    """Process an incoming message."""
+def handle_message(msg):
     chat_id = msg["chat"]["id"]
     user_id = msg.get("from", {}).get("id", 0)
     text = msg.get("text", "").strip()
-    lang = await get_lang(chat_id)
+    if not text:
+        return
+    lang = get_lang(chat_id)
 
-    # ── General Commands ──
-
+    # /start
     if text.startswith("/start"):
-        await tg_send(chat_id, t("welcome", lang), simple_keyboard(lang, "welcome"))
+        tg_send(chat_id, t("welcome", lang), simple_keyboard(lang, "welcome"))
         return
 
+    # /help
     if text.startswith("/help"):
         help_text = t("help", lang)
         if is_admin(user_id):
             help_text += "\n\n" + t("admin_help", lang)
-        await tg_send(chat_id, help_text, simple_keyboard(lang, "help"))
+        tg_send(chat_id, help_text, simple_keyboard(lang, "help"))
         return
 
+    # /lang
     if text.startswith("/lang"):
         parts = text.split()
         if len(parts) >= 2 and parts[1].lower() in ("en", "zh"):
             new_lang = parts[1].lower()
-            await set_lang(chat_id, new_lang)
-            await tg_send(chat_id, t("lang_switched", new_lang), simple_keyboard(new_lang, "help"))
+            set_lang(chat_id, new_lang)
+            tg_send(chat_id, t("lang_switched", new_lang), simple_keyboard(new_lang, "help"))
         else:
-            await tg_send(chat_id, "Usage: /lang en | /lang zh")
+            tg_send(chat_id, "Usage: /lang en | /lang zh")
         return
 
-    # ── Admin: Button Management ──
+    # ── Admin Commands ──
 
     if text.startswith("/addbutton"):
         if not is_admin(user_id):
-            await tg_send(chat_id, t("no_permission", lang))
+            tg_send(chat_id, t("no_permission", lang))
             return
         content = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else ""
         parsed = parse_button_input(content)
         if not parsed:
-            await tg_send(chat_id, t("btn_invalid_fmt", lang))
+            tg_send(chat_id, t("btn_invalid_fmt", lang))
             return
         btn_text, btn_url = parsed
-        buttons = await get_buttons()
+        buttons = get_buttons()
         buttons.append({"text": btn_text, "url": btn_url})
-        await save_buttons(buttons)
-        await tg_send(chat_id, t("btn_added", lang, text=btn_text))
+        save_buttons(buttons)
+        tg_send(chat_id, t("btn_added", lang, text=btn_text))
         return
 
     if text.startswith("/editbutton"):
         if not is_admin(user_id):
-            await tg_send(chat_id, t("no_permission", lang))
+            tg_send(chat_id, t("no_permission", lang))
             return
-        # Format: /editbutton 1 New Text | https://new-url
         parts = text.split(maxsplit=2)
         if len(parts) < 3:
-            await tg_send(chat_id, "Usage: /editbutton <number> <text> | <url>")
+            tg_send(chat_id, "Usage: /editbutton <num> <text> | <url>")
             return
         try:
             idx = int(parts[1]) - 1
         except ValueError:
-            await tg_send(chat_id, t("btn_invalid_num", lang))
+            tg_send(chat_id, t("btn_invalid_num", lang))
             return
         parsed = parse_button_input(parts[2])
         if not parsed:
-            await tg_send(chat_id, t("btn_invalid_fmt", lang))
+            tg_send(chat_id, t("btn_invalid_fmt", lang))
             return
-        buttons = await get_buttons()
+        buttons = get_buttons()
         if idx < 0 or idx >= len(buttons):
-            await tg_send(chat_id, t("btn_invalid_num", lang))
+            tg_send(chat_id, t("btn_invalid_num", lang))
             return
         btn_text, btn_url = parsed
         buttons[idx] = {"text": btn_text, "url": btn_url}
-        await save_buttons(buttons)
-        await tg_send(chat_id, t("btn_edited", lang, num=idx + 1, text=btn_text))
+        save_buttons(buttons)
+        tg_send(chat_id, t("btn_edited", lang, num=idx + 1, text=btn_text))
         return
 
     if text.startswith("/removebutton"):
         if not is_admin(user_id):
-            await tg_send(chat_id, t("no_permission", lang))
+            tg_send(chat_id, t("no_permission", lang))
             return
         parts = text.split()
         if len(parts) < 2:
-            await tg_send(chat_id, "Usage: /removebutton <number>")
+            tg_send(chat_id, "Usage: /removebutton <num>")
             return
         try:
             idx = int(parts[1]) - 1
         except ValueError:
-            await tg_send(chat_id, t("btn_invalid_num", lang))
+            tg_send(chat_id, t("btn_invalid_num", lang))
             return
-        buttons = await get_buttons()
+        buttons = get_buttons()
         if idx < 0 or idx >= len(buttons):
-            await tg_send(chat_id, t("btn_invalid_num", lang))
+            tg_send(chat_id, t("btn_invalid_num", lang))
             return
         buttons.pop(idx)
-        await save_buttons(buttons)
-        await tg_send(chat_id, t("btn_removed", lang, num=idx + 1))
+        save_buttons(buttons)
+        tg_send(chat_id, t("btn_removed", lang, num=idx + 1))
         return
 
     if text.startswith("/listbuttons"):
         if not is_admin(user_id):
-            await tg_send(chat_id, t("no_permission", lang))
+            tg_send(chat_id, t("no_permission", lang))
             return
-        buttons = await get_buttons()
+        buttons = get_buttons()
         if not buttons:
-            await tg_send(chat_id, t("btn_list_empty", lang))
+            tg_send(chat_id, t("btn_list_empty", lang))
             return
         lines = ["📋 Current Buttons:" if lang == "en" else "📋 当前按钮：", ""]
         for i, btn in enumerate(buttons, 1):
             lines.append(f"{i}. {btn['text']}\n   → {btn['url']}")
-        await tg_send(chat_id, "\n".join(lines))
+        tg_send(chat_id, "\n".join(lines))
         return
 
     if text.startswith("/clearbuttons"):
         if not is_admin(user_id):
-            await tg_send(chat_id, t("no_permission", lang))
+            tg_send(chat_id, t("no_permission", lang))
             return
-        await redis_del(REDIS_BUTTONS_KEY)
-        await tg_send(chat_id, t("btn_cleared", lang))
+        redis_del(REDIS_BUTTONS_KEY)
+        tg_send(chat_id, t("btn_cleared", lang))
         return
 
-    # ── Trending ──
-
+    # /trending
     if text.startswith("/trending"):
-        await handle_trending(chat_id, lang)
+        handle_trending(chat_id, lang)
         return
 
-    # ── Price Queries (multi-token support) ──
-
+    # /p or /price (multi-token)
     if text.startswith("/p ") or text.startswith("/price "):
         parts = text.split()
         symbols = [s.upper() for s in parts[1:] if s and not s.startswith("/")]
         if not symbols:
-            await tg_send(chat_id, t("help", lang), simple_keyboard(lang, "help"))
+            tg_send(chat_id, t("help", lang), simple_keyboard(lang, "help"))
             return
         if len(symbols) > 5:
-            await tg_send(chat_id, t("multi_query_max", lang))
+            tg_send(chat_id, t("multi_query_max", lang))
             symbols = symbols[:5]
-        for symbol in symbols:
-            await query_and_reply(chat_id, symbol, lang)
+        for sym in symbols:
+            query_and_reply(chat_id, sym, lang)
         return
 
-    # /p@botname <symbol> (group commands with bot username)
+    # /p@botname
     if text.startswith("/p@") or text.startswith("/price@"):
         parts = text.split()
-        symbols = [s.upper() for s in parts[1:] if s]
-        for symbol in symbols[:5]:
-            await query_and_reply(chat_id, symbol, lang)
+        for sym in [s.upper() for s in parts[1:]][:5]:
+            query_and_reply(chat_id, sym, lang)
         return
 
-    # $BTC style (supports multiple: $BTC $ETH)
+    # $BTC style
     matches = re.findall(r"\$([A-Za-z0-9]{1,10})", text)
     if matches:
-        for symbol in [m.upper() for m in matches[:5]]:
-            await query_and_reply(chat_id, symbol, lang)
+        for sym in [m.upper() for m in matches[:5]]:
+            query_and_reply(chat_id, sym, lang)
 
 
-async def handle_callback_query(cbq: dict):
-    """Process an inline button click."""
+def handle_callback_query(cbq):
     callback_id = cbq["id"]
     data = cbq.get("data", "")
     chat_id = cbq["message"]["chat"]["id"]
     message_id = cbq["message"]["message_id"]
 
-    await tg_answer_callback(callback_id)
+    tg_answer_callback(callback_id)
 
-    # Price message language switch: lang:<target_lang>:<symbol>
     if data.startswith("lang:"):
         parts = data.split(":", 2)
         if len(parts) == 3:
-            new_lang = parts[1]
-            symbol = parts[2]
-            await set_lang(chat_id, new_lang)
-
-            price_data = await fetch_price(symbol)
+            new_lang, symbol = parts[1], parts[2]
+            set_lang(chat_id, new_lang)
+            price_data = fetch_price(symbol)
             if price_data:
                 text = build_price_msg(price_data, new_lang)
-                kb = await price_keyboard(symbol, new_lang)
-                await tg_edit(chat_id, message_id, text, kb)
+                kb = price_keyboard(symbol, new_lang)
+                tg_edit(chat_id, message_id, text, kb)
             else:
-                await tg_edit(chat_id, message_id,
-                              t("not_found", new_lang, symbol=symbol),
-                              simple_keyboard(new_lang))
+                tg_edit(chat_id, message_id,
+                        t("not_found", new_lang, symbol=symbol),
+                        simple_keyboard(new_lang))
 
-    # Simple message language switch: slang:<target_lang>:<msg_type>
     elif data.startswith("slang:"):
         parts = data.split(":", 2)
         if len(parts) == 3:
-            new_lang = parts[1]
-            msg_type = parts[2]
-            await set_lang(chat_id, new_lang)
-
+            new_lang, msg_type = parts[1], parts[2]
+            set_lang(chat_id, new_lang)
             if msg_type == "welcome":
                 text = t("welcome", new_lang)
             else:
                 text = t("help", new_lang)
-            await tg_edit(chat_id, message_id, text, simple_keyboard(new_lang, msg_type))
+            tg_edit(chat_id, message_id, text, simple_keyboard(new_lang, msg_type))
 
 
-async def handle_trending(chat_id: int, lang: str):
-    """Fetch and send trending coins."""
-    try:
-        coins = await fetch_trending()
-    except Exception:
-        await tg_send(chat_id, t("error", lang))
-        return
-
+def handle_trending(chat_id, lang):
+    coins = fetch_trending()
     if not coins:
-        await tg_send(chat_id, t("trending_empty", lang))
+        tg_send(chat_id, t("trending_empty", lang))
         return
-
     lines = [t("trending_title", lang), "━" * 24]
     for i, coin in enumerate(coins, 1):
         rank_str = f"#{coin['rank']}" if coin.get("rank") else "—"
         lines.append(f"{i}. {coin['name']} ({coin['symbol']})  [{rank_str}]")
-
-    # Add tip to query
-    if lang == "zh":
-        lines.append("\n💡 输入 /p <代币> 查看详情")
-    else:
-        lines.append("\n💡 Use /p <symbol> for details")
-
-    await tg_send(chat_id, "\n".join(lines), simple_keyboard(lang, "help"))
+    tip = "\n💡 输入 /p <代币> 查看详情" if lang == "zh" else "\n💡 Use /p <symbol> for details"
+    lines.append(tip)
+    tg_send(chat_id, "\n".join(lines), simple_keyboard(lang, "help"))
 
 
-async def query_and_reply(chat_id: int, symbol: str, lang: str):
-    """Fetch price and send to chat."""
+def query_and_reply(chat_id, symbol, lang):
     try:
-        price_data = await fetch_price(symbol)
+        price_data = fetch_price(symbol)
     except Exception:
-        await tg_send(chat_id, t("error", lang))
+        tg_send(chat_id, t("error", lang))
         return
-
     if not price_data:
-        await tg_send(chat_id, t("not_found", lang, symbol=symbol), simple_keyboard(lang))
+        tg_send(chat_id, t("not_found", lang, symbol=symbol), simple_keyboard(lang))
         return
-
     text = build_price_msg(price_data, lang)
-    kb = await price_keyboard(symbol, lang)
-    await tg_send(chat_id, text, kb)
+    kb = price_keyboard(symbol, lang)
+    tg_send(chat_id, text, kb)
 
 
-async def handle_inline_query(inline_query: dict):
-    """Handle inline mode: user types @botname btc in any chat."""
-    query_id = inline_query["id"]
-    query_text = inline_query.get("query", "").strip()
-
-    if not query_text or len(query_text) < 1:
-        # Return empty result
-        await tg_answer_inline(query_id, [])
+def handle_inline_query(iq):
+    query_id = iq["id"]
+    query_text = iq.get("query", "").strip()
+    if not query_text:
+        tg_answer_inline(query_id, [])
         return
-
-    # Try to fetch price for the query
-    try:
-        price_data = await fetch_price(query_text)
-    except Exception:
-        await tg_answer_inline(query_id, [])
-        return
-
+    price_data = fetch_price(query_text)
     if not price_data:
-        await tg_answer_inline(query_id, [])
+        tg_answer_inline(query_id, [])
         return
-
-    # Build result
-    lang = DEFAULT_LANG
-    msg_text = build_price_msg(price_data, lang)
-    buttons = await get_buttons()
-    keyboard = []
-    for btn in buttons:
-        keyboard.append([{"text": btn["text"], "url": btn["url"]}])
-
+    msg_text = build_price_msg(price_data, DEFAULT_LANG)
+    buttons = get_buttons()
+    keyboard = [[{"text": b["text"], "url": b["url"]}] for b in buttons]
     result = {
         "type": "article",
         "id": f"price_{price_data['symbol']}",
         "title": f"{price_data['name']} ({price_data['symbol']})",
-        "description": f"${fmt_num(price_data['price_usd'])}  {fmt_change(price_data.get('change_24h'))}%",
+        "description": f"${fmt_num(price_data['price_usd'])}",
         "input_message_content": {"message_text": msg_text},
     }
     if keyboard:
         result["reply_markup"] = {"inline_keyboard": keyboard}
-
-    await tg_answer_inline(query_id, [result])
-
-
-async def tg_answer_inline(inline_query_id: str, results: list):
-    """Answer an inline query."""
-    payload = {
-        "inline_query_id": inline_query_id,
-        "results": json.dumps(results),
-        "cache_time": 30,
-    }
-    async with aiohttp.ClientSession() as s:
-        await s.post(f"{TELEGRAM_API}/answerInlineQuery", data=payload)
+    tg_answer_inline(query_id, [result])
 
 
 # ─── Vercel Handler ──────────────────────────────────────────────
 
 class handler(BaseHTTPRequestHandler):
-    """Vercel Serverless Function entry point."""
 
     def do_POST(self):
-        content_length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(content_length)
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"ok":true}')
 
         try:
             update = json.loads(body)
-        except json.JSONDecodeError:
-            self.send_response(400)
-            self.end_headers()
+        except Exception:
             return
 
-        if "message" in update:
-            asyncio.run(handle_message(update["message"]))
-        elif "callback_query" in update:
-            asyncio.run(handle_callback_query(update["callback_query"]))
-        elif "inline_query" in update:
-            asyncio.run(handle_inline_query(update["inline_query"]))
-
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b'{"ok": true}')
+        try:
+            if "message" in update:
+                handle_message(update["message"])
+            elif "callback_query" in update:
+                handle_callback_query(update["callback_query"])
+            elif "inline_query" in update:
+                handle_inline_query(update["inline_query"])
+        except Exception:
+            pass  # Silently handle errors to avoid 500
 
     def do_GET(self):
-        """Health check."""
         self.send_response(200)
+        self.send_header("Content-Type", "application/json")
         self.end_headers()
-        self.wfile.write(b'{"status": "BitBaby Price Bot is running"}')
+        self.wfile.write(b'{"status":"BitBaby Price Bot is running"}')
+
+    def log_message(self, format, *args):
+        pass  # Suppress default logging
