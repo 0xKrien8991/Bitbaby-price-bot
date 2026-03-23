@@ -11,6 +11,8 @@ Features:
 - Upstash Redis for persistent storage (buttons + language prefs)
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 import os
