@@ -365,14 +365,14 @@ def simple_keyboard(lang, msg_type="help"):
 def tg_send(chat_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "text": text}
     if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
+        payload["reply_markup"] = reply_markup
     http_post_json(f"{TELEGRAM_API}/sendMessage", payload)
 
 
 def tg_edit(chat_id, message_id, text, reply_markup=None):
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if reply_markup:
-        payload["reply_markup"] = json.dumps(reply_markup)
+        payload["reply_markup"] = reply_markup
     http_post_json(f"{TELEGRAM_API}/editMessageText", payload)
 
 
