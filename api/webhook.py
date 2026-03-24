@@ -460,9 +460,8 @@ def handle_message(msg):
         text_en, text_zh, btn_url = parsed
         buttons = get_buttons()
         buttons.append({"text_en": text_en, "text_zh": text_zh, "url": btn_url})
-        result = save_buttons(buttons)
-        debug = f"\n\n[DEBUG] Redis response: {result}\n[DEBUG] UPSTASH_URL set: {bool(UPSTASH_URL)}"
-        tg_send(chat_id, t("btn_added", lang, text=f"{text_en} / {text_zh}") + debug)
+        save_buttons(buttons)
+        tg_send(chat_id, t("btn_added", lang, text=f"{text_en} / {text_zh}"))
         return
 
     if text.startswith("/editbutton"):
@@ -570,6 +569,17 @@ def handle_message(msg):
     if matches:
         for sym in [m.upper() for m in matches[:5]]:
             query_and_reply(chat_id, sym, lang)
+        return
+
+    # Plain text symbol detection: "BTC", "btc", "Eth" etc.
+    # Only trigger if the entire message is 1-5 short tokens that look like symbols
+    words = text.split()
+    if 1 <= len(words) <= 3 and all(re.match(r'^[A-Za-z0-9]{1,10}$', w) for w in words):
+        # Check if at least the first word is a known symbol
+        first = words[0].lower()
+        if first in SYMBOL_TO_ID:
+            for w in words[:5]:
+                query_and_reply(chat_id, w.upper(), lang)
 
 
 def handle_callback_query(cbq):
